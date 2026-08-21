@@ -53,3 +53,24 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Build output
+/build/
+/bin/
+
+# Core dumps
+core
+core.*
+vgcore.*
+
+# Profiling
+perf.data
+perf.data.old
+
+/*.log
+/scratch/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
