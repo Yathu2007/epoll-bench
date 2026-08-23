@@ -114,9 +114,14 @@ static int conn_flush(conn *c) {
     return 0;
 }
 
-/* Echo every complete frame sitting in the read buffer. */
+/*
+ * Echo every complete frame sitting in the read buffer. Frames are already in
+ * wire format, so a run of them is echoed with a single write rather than one
+ * write per frame.
+ */
 static int conn_process(conn *c) {
     size_t off = 0;
+    unsigned long frames = 0;
 
     for (;;) {
         if (c->rlen - off < PROTO_HDR_LEN) break;
@@ -129,14 +134,13 @@ static int conn_process(conn *c) {
             if (rbuf_reserve(c, need) < 0) return -1;
             break;
         }
-        /* Frames are already in wire format, so the read buffer doubles as
-         * the response buffer. */
-        if (conn_send(c, c->rbuf + off, need) < 0) return -1;
-        atomic_fetch_add(&g_stats.requests, 1);
         off += need;
+        frames++;
     }
 
     if (off > 0) {
+        if (conn_send(c, c->rbuf, off) < 0) return -1;
+        atomic_fetch_add(&g_stats.requests, frames);
         c->rlen -= off;
         if (c->rlen) memmove(c->rbuf, c->rbuf + off, c->rlen);
     }
