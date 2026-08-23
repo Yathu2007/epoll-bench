@@ -1,5 +1,6 @@
 /*
  * Thread-per-connection mode: one detached pthread per connection, blocking I/O.
+ * SIGINT or SIGTERM breaks the accept loop.
  */
 #define _GNU_SOURCE
 #include "server.h"
@@ -89,7 +90,7 @@ void run_thread_per_conn(int lfd) {
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
-    for (;;) {
+    while (!g_stop) {
         int cfd = accept(lfd, NULL, NULL);
         if (cfd < 0) {
             if (errno == EINTR) continue;

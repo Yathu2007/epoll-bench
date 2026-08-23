@@ -2,13 +2,14 @@
  * Framed-echo TCP server: one pthread per connection, blocking I/O.
  *
  * This file holds the parts that are not about I/O strategy - ie. argument
- * parsing and the listening socket
+ * parsing, signal handling and the listening socket
  */
 
 #define _GNU_SOURCE
 #include "server.h"
 
 #include <netinet/in.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +18,17 @@
 #include <unistd.h>
 
 struct server_stats g_stats;
+
+volatile sig_atomic_t g_stop;
+static int g_listen_fd = -1;
+
+static void on_signal(int sig) {
+    (void)sig;
+    g_stop = 1;
+    /* The signal may be delivered to a connection thread, which leaves the
+     * accept loop blocked; shutting the listener down wakes it. */
+    if (g_listen_fd >= 0) shutdown(g_listen_fd, SHUT_RDWR);
+}
 
 void bump_active(long delta) {
     long now = atomic_fetch_add(&g_stats.active, delta) + delta;
@@ -71,7 +83,16 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = SIG_IGN;
+    sigaction(SIGPIPE, &sa, NULL);
+    sa.sa_handler = on_signal; /* no SA_RESTART: blocking accept must return */
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
     int lfd = listen_socket((int)port, (int)backlog);
+    g_listen_fd = lfd;
     fprintf(stderr, "listening port=%ld backlog=%ld\n", port, backlog);
 
     run_thread_per_conn(lfd);

@@ -2,6 +2,7 @@
 #ifndef SERVER_H
 #define SERVER_H
 
+#include <signal.h>
 #include <stdatomic.h>
 
 #include "common.h"
@@ -16,6 +17,9 @@ struct server_stats {
 };
 
 extern struct server_stats g_stats;
+
+/* Set by SIGINT/SIGTERM; the accept loop polls it. */
+extern volatile sig_atomic_t g_stop;
 
 void bump_active(long delta);
 void report(void);
