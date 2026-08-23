@@ -86,6 +86,7 @@ out:
 }
 
 void run_thread_per_conn(int lfd, long stack_kb) {
+    int reported_limit = 0;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
@@ -104,7 +105,15 @@ void run_thread_per_conn(int lfd, long stack_kb) {
         set_nodelay(cfd);
 
         pthread_t th;
-        if (pthread_create(&th, &attr, conn_thread, (void *)(intptr_t)cfd) != 0) {
+        int rc = pthread_create(&th, &attr, conn_thread, (void *)(intptr_t)cfd);
+        if (rc != 0) {
+            /* thread-per-connection ceiling */
+            if (!reported_limit) {
+                reported_limit = 1;
+                fprintf(stderr, "thread-limit conns=%ld reason=%s\n", atomic_load(&g_stats.active),
+                        strerror(rc));
+            }
+            atomic_fetch_add(&g_stats.errors, 1);
             close(cfd);
             continue;
         }
