@@ -16,6 +16,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#define WBUF_HIGH (256u * 1024u) /* stop reading above this backlog */
+#define WBUF_LOW (64u * 1024u)   /* resume reading below this       */
 #define MAX_EVENTS 512
 
 typedef struct conn {
@@ -149,6 +151,7 @@ static int conn_process(conn *c) {
 
 static int conn_read(conn *c) {
     for (;;) {
+        if (wbuf_pending(c) >= WBUF_HIGH) return 0; /* back-pressure */
         if (c->rlen == c->rcap && rbuf_reserve(c, c->rcap * 2) < 0) return -1;
 
         ssize_t r = read(c->fd, c->rbuf + c->rlen, c->rcap - c->rlen);
@@ -233,8 +236,10 @@ void run_epoll(int lfd, const char *mode) {
             if (!dead && conn_flush(c) < 0) dead = 1;
 
             if (!dead) {
-                uint32_t want = EPOLLIN | EPOLLET;
-                if (wbuf_pending(c) > 0) want |= EPOLLOUT;
+                uint32_t want = EPOLLET;
+                size_t pending = wbuf_pending(c);
+                if (pending > 0) want |= EPOLLOUT;
+                if (pending < WBUF_LOW) want |= EPOLLIN;
                 if (mod_events(epfd, c, want) < 0) dead = 1;
             }
 
