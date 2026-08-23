@@ -22,12 +22,24 @@ typedef struct conn {
     int fd;
     unsigned char *rbuf;
     size_t rcap, rlen;
+    unsigned char *wbuf;
+    size_t wcap, wlen, woff; /* pending bytes are wbuf[woff .. wlen) */
+    uint32_t events;         /* what is currently registered */
 } conn;
+
+static int mod_events(int epfd, conn *c, uint32_t events) {
+    if (events == c->events) return 0;
+    struct epoll_event ev = {.events = events, .data.ptr = c};
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD, c->fd, &ev) < 0) return -1;
+    c->events = events;
+    return 0;
+}
 
 static void conn_free(int epfd, conn *c) {
     epoll_ctl(epfd, EPOLL_CTL_DEL, c->fd, NULL);
     close(c->fd);
     free(c->rbuf);
+    free(c->wbuf);
     free(c);
     bump_active(-1);
 }
@@ -43,20 +55,62 @@ static int rbuf_reserve(conn *c, size_t need) {
     return 0;
 }
 
-/* Echo one frame. A socket that will not take all of it drops the connection
- * for now; buffering the remainder comes next. */
-static int conn_write_all(conn *c, const unsigned char *data, size_t n) {
+/* Append to the write buffer, compacting consumed bytes first. */
+static int wbuf_append(conn *c, const unsigned char *data, size_t n) {
+    if (c->woff > 0) {
+        memmove(c->wbuf, c->wbuf + c->woff, c->wlen - c->woff);
+        c->wlen -= c->woff;
+        c->woff = 0;
+    }
+    if (c->wlen + n > c->wcap) {
+        size_t cap = c->wcap ? c->wcap : 4096;
+        while (cap < c->wlen + n) cap *= 2;
+        unsigned char *p = realloc(c->wbuf, cap);
+        if (!p) return -1;
+        c->wbuf = p;
+        c->wcap = cap;
+    }
+    memcpy(c->wbuf + c->wlen, data, n);
+    c->wlen += n;
+    return 0;
+}
+
+static size_t wbuf_pending(const conn *c) { return c->wlen - c->woff; }
+
+/* Write out `data`, buffering whatever the socket would not take. */
+static int conn_send(conn *c, const unsigned char *data, size_t n) {
     size_t off = 0;
-    while (off < n) {
-        ssize_t w = write(c->fd, data + off, n - off);
+    if (wbuf_pending(c) == 0) {
+        while (off < n) {
+            ssize_t w = write(c->fd, data + off, n - off);
+            if (w > 0) {
+                off += (size_t)w;
+                continue;
+            }
+            if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+            if (w < 0 && errno == EINTR) continue;
+            return -1;
+        }
+        atomic_fetch_add(&g_stats.bytes_out, off);
+    }
+    if (off < n) return wbuf_append(c, data + off, n - off);
+    return 0;
+}
+
+/* Flush buffered output. Returns -1 on a fatal socket error. */
+static int conn_flush(conn *c) {
+    while (wbuf_pending(c) > 0) {
+        ssize_t w = write(c->fd, c->wbuf + c->woff, wbuf_pending(c));
         if (w > 0) {
-            off += (size_t)w;
+            c->woff += (size_t)w;
+            atomic_fetch_add(&g_stats.bytes_out, (size_t)w);
             continue;
         }
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
         if (w < 0 && errno == EINTR) continue;
         return -1;
     }
-    atomic_fetch_add(&g_stats.bytes_out, off);
+    c->woff = c->wlen = 0;
     return 0;
 }
 
@@ -77,7 +131,7 @@ static int conn_process(conn *c) {
         }
         /* Frames are already in wire format, so the read buffer doubles as
          * the response buffer. */
-        if (conn_write_all(c, c->rbuf + off, need) < 0) return -1;
+        if (conn_send(c, c->rbuf + off, need) < 0) return -1;
         atomic_fetch_add(&g_stats.requests, 1);
         off += need;
     }
@@ -150,7 +204,8 @@ void run_epoll(int lfd, const char *mode) {
                         continue;
                     }
                     c->fd = cfd;
-                    struct epoll_event cev = {.events = EPOLLIN | EPOLLET, .data.ptr = c};
+                    c->events = EPOLLIN | EPOLLET;
+                    struct epoll_event cev = {.events = c->events, .data.ptr = c};
                     if (epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &cev) < 0) {
                         free(c->rbuf);
                         free(c);
@@ -169,7 +224,15 @@ void run_epoll(int lfd, const char *mode) {
             int dead = 0;
 
             if (e & (EPOLLERR | EPOLLHUP)) dead = 1;
+            if (!dead && (e & EPOLLOUT) && conn_flush(c) < 0) dead = 1;
             if (!dead && (e & EPOLLIN) && conn_read(c) < 0) dead = 1;
+            if (!dead && conn_flush(c) < 0) dead = 1;
+
+            if (!dead) {
+                uint32_t want = EPOLLIN | EPOLLET;
+                if (wbuf_pending(c) > 0) want |= EPOLLOUT;
+                if (mod_events(epfd, c, want) < 0) dead = 1;
+            }
 
             if (dead) conn_free(epfd, c);
         }
