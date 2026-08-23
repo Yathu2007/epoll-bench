@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -21,6 +22,7 @@
 #define MAX_EVENTS 512
 
 typedef struct conn {
+    struct conn *prev, *next; /* live-connection list, for shutdown */
     int fd;
     unsigned char *rbuf;
     size_t rcap, rlen;
@@ -29,6 +31,24 @@ typedef struct conn {
     uint32_t events;         /* what is currently registered */
     int peer_closed;         /* saw EOF; close once the write buffer drains */
 } conn;
+
+/* Only the epoll mode keeps this list: it is single-threaded, so no locking. */
+static conn *g_live;
+
+static void live_link(conn *c) {
+    c->prev = NULL;
+    c->next = g_live;
+    if (g_live) g_live->prev = c;
+    g_live = c;
+}
+
+static void live_unlink(conn *c) {
+    if (c->prev)
+        c->prev->next = c->next;
+    else
+        g_live = c->next;
+    if (c->next) c->next->prev = c->prev;
+}
 
 static int mod_events(int epfd, conn *c, uint32_t events) {
     if (events == c->events) return 0;
@@ -39,6 +59,7 @@ static int mod_events(int epfd, conn *c, uint32_t events) {
 }
 
 static void conn_free(int epfd, conn *c) {
+    live_unlink(c);
     epoll_ctl(epfd, EPOLL_CTL_DEL, c->fd, NULL);
     close(c->fd);
     free(c->rbuf);
@@ -179,11 +200,15 @@ void run_epoll(int lfd, const char *mode) {
     struct epoll_event ev = {.events = EPOLLIN | EPOLLET, .data.ptr = NULL};
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, lfd, &ev) < 0) die("epoll_ctl listen");
 
+    g_wake_fd = eventfd(0, EFD_NONBLOCK);
+    struct epoll_event wev = {.events = EPOLLIN, .data.ptr = &g_wake_fd};
+    epoll_ctl(epfd, EPOLL_CTL_ADD, g_wake_fd, &wev);
+
     struct epoll_event *events = calloc(MAX_EVENTS, sizeof(*events));
     if (!events) die("calloc events");
 
     while (!g_stop) {
-        int n = epoll_wait(epfd, events, MAX_EVENTS, 100);
+        int n = epoll_wait(epfd, events, MAX_EVENTS, -1);
         if (n < 0) {
             if (errno == EINTR) continue;
             die("epoll_wait");
@@ -191,6 +216,8 @@ void run_epoll(int lfd, const char *mode) {
 
         for (int i = 0; i < n; i++) {
             void *ptr = events[i].data.ptr;
+
+            if (ptr == &g_wake_fd) continue; /* shutdown nudge */
 
             if (ptr == NULL) {
                 /* Listening socket is edge-triggered: drain the accept queue. */
@@ -224,6 +251,7 @@ void run_epoll(int lfd, const char *mode) {
                         atomic_fetch_add(&g_stats.errors, 1);
                         continue;
                     }
+                    live_link(c);
                     atomic_fetch_add(&g_stats.accepted, 1);
                     bump_active(1);
                 }
@@ -252,6 +280,16 @@ void run_epoll(int lfd, const char *mode) {
             if (dead) conn_free(epfd, c);
         }
     }
+
+    /* Graceful shutdown: flush what we can, then close every live connection. */
+    long closed = 0;
+    while (g_live) {
+        conn *c = g_live;
+        conn_flush(c);
+        conn_free(epfd, c);
+        closed++;
+    }
+    fprintf(stderr, "shutdown closed_connections=%ld\n", closed);
 
     free(events);
     close(epfd);

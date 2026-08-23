@@ -25,13 +25,19 @@
 struct server_stats g_stats;
 
 volatile sig_atomic_t g_stop;
+int g_wake_fd = -1;          /* eventfd, wakes the epoll loop on SIGINT */
 static int g_listen_fd = -1;
 
 static void on_signal(int sig) {
     (void)sig;
     g_stop = 1;
-    /* The signal may be delivered to a connection thread, which leaves the
-     * accept loop blocked; shutting the listener down wakes it. */
+    if (g_wake_fd >= 0) {
+        uint64_t one = 1;
+        ssize_t r = write(g_wake_fd, &one, sizeof(one));
+        (void)r;
+    }
+    /* In thread mode the signal may be delivered to a connection thread, which
+     * leaves the accept loop blocked; shutting the listener down wakes it. */
     if (g_listen_fd >= 0) shutdown(g_listen_fd, SHUT_RDWR);
 }
 

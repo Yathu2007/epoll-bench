@@ -20,6 +20,10 @@ extern struct server_stats g_stats;
 
 /* Set by SIGINT/SIGTERM; both loops poll it. */
 extern volatile sig_atomic_t g_stop;
+/* eventfd the signal handler writes to, so the epoll loop's blocking wait
+ * returns instead of sitting on an infinite timeout. -1 until run_epoll arms
+ * it, which is why the handler checks before writing. */
+extern int g_wake_fd;
 
 void bump_active(long delta);
 void report(const char *mode);
