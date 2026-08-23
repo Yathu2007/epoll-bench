@@ -74,3 +74,5 @@ perf.data.old
 .vscode/
 .idea/
 .DS_Store
+bin/
+results/logs/
