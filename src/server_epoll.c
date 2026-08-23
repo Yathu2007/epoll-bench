@@ -27,6 +27,7 @@ typedef struct conn {
     unsigned char *wbuf;
     size_t wcap, wlen, woff; /* pending bytes are wbuf[woff .. wlen) */
     uint32_t events;         /* what is currently registered */
+    int peer_closed;         /* saw EOF; close once the write buffer drains */
 } conn;
 
 static int mod_events(int epfd, conn *c, uint32_t events) {
@@ -161,7 +162,10 @@ static int conn_read(conn *c) {
             if (conn_process(c) < 0) return -1;
             continue;
         }
-        if (r == 0) return -1; /* peer closed */
+        if (r == 0) {
+            c->peer_closed = 1;
+            return 0;
+        }
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
         if (errno == EINTR) continue;
         return -1;
@@ -211,7 +215,7 @@ void run_epoll(int lfd, const char *mode) {
                         continue;
                     }
                     c->fd = cfd;
-                    c->events = EPOLLIN | EPOLLET;
+                    c->events = EPOLLIN | EPOLLET | EPOLLRDHUP;
                     struct epoll_event cev = {.events = c->events, .data.ptr = c};
                     if (epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &cev) < 0) {
                         free(c->rbuf);
@@ -232,15 +236,17 @@ void run_epoll(int lfd, const char *mode) {
 
             if (e & (EPOLLERR | EPOLLHUP)) dead = 1;
             if (!dead && (e & EPOLLOUT) && conn_flush(c) < 0) dead = 1;
-            if (!dead && (e & EPOLLIN) && conn_read(c) < 0) dead = 1;
+            if (!dead && (e & (EPOLLIN | EPOLLRDHUP)) && conn_read(c) < 0) dead = 1;
             if (!dead && conn_flush(c) < 0) dead = 1;
 
             if (!dead) {
-                uint32_t want = EPOLLET;
+                uint32_t want = EPOLLET | EPOLLRDHUP;
                 size_t pending = wbuf_pending(c);
                 if (pending > 0) want |= EPOLLOUT;
-                if (pending < WBUF_LOW) want |= EPOLLIN;
+                if (!c->peer_closed && pending < WBUF_LOW) want |= EPOLLIN;
                 if (mod_events(epfd, c, want) < 0) dead = 1;
+                /* Peer is gone and everything is flushed: nothing left to do. */
+                if (c->peer_closed && pending == 0) dead = 1;
             }
 
             if (dead) conn_free(epfd, c);
