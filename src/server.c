@@ -74,12 +74,13 @@ static int listen_socket(int port, int backlog) {
 }
 
 int main(int argc, char **argv) {
-    long port = 9000, backlog = 4096;
+    long port = 9000, backlog = 4096, stack_kb = 512;
 
     for (int i = 1; i < argc; i++) {
         if (arg_long(argv[i], "port", &port)) continue;
         if (arg_long(argv[i], "backlog", &backlog)) continue;
-        fprintf(stderr, "usage: %s [--port=9000] [--backlog=4096]\n", argv[0]);
+        if (arg_long(argv[i], "stack-kb", &stack_kb)) continue;
+        fprintf(stderr, "usage: %s [--port=9000] [--backlog=4096] [--stack-kb=512]\n", argv[0]);
         return 2;
     }
 
@@ -95,6 +96,6 @@ int main(int argc, char **argv) {
     g_listen_fd = lfd;
     fprintf(stderr, "listening port=%ld backlog=%ld\n", port, backlog);
 
-    run_thread_per_conn(lfd);
+    run_thread_per_conn(lfd, stack_kb);
     return 0;
 }

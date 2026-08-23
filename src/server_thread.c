@@ -1,6 +1,6 @@
 /*
- * Thread-per-connection mode: one detached pthread per connection, blocking I/O.
- * SIGINT or SIGTERM breaks the accept loop.
+ * Thread-per-connection mode: one detached pthread per connection, blocking I/O,
+ * --stack-kb (default 512) per thread. SIGINT or SIGTERM breaks the accept loop.
  */
 #define _GNU_SOURCE
 #include "server.h"
@@ -85,10 +85,11 @@ out:
     return NULL;
 }
 
-void run_thread_per_conn(int lfd) {
+void run_thread_per_conn(int lfd, long stack_kb) {
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (stack_kb > 0) pthread_attr_setstacksize(&attr, (size_t)stack_kb * 1024);
 
     while (!g_stop) {
         int cfd = accept(lfd, NULL, NULL);

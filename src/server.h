@@ -24,6 +24,6 @@ extern volatile sig_atomic_t g_stop;
 void bump_active(long delta);
 void report(void);
 
-void run_thread_per_conn(int lfd);
+void run_thread_per_conn(int lfd, long stack_kb);
 
 #endif
