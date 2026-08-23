@@ -6,7 +6,7 @@ LDLIBS  ?= -lpthread
 BIN     := bin
 SRC     := src
 
-SERVER_SRC  := $(SRC)/server.c $(SRC)/server_thread.c $(SRC)/common.c
+SERVER_SRC  := $(SRC)/server.c $(SRC)/server_epoll.c $(SRC)/server_thread.c $(SRC)/common.c
 HDRS        := $(SRC)/server.h $(SRC)/common.h
 
 all: $(BIN)/server

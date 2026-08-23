@@ -1,8 +1,13 @@
 /*
- * Framed-echo TCP server: one pthread per connection, blocking I/O.
+ * Framed-echo TCP server.
  *
- * This file holds the parts that are not about I/O strategy - ie. argument
- * parsing, signal handling and the listening socket
+ *   --mode=epoll   single thread, edge-triggered epoll, non-blocking sockets
+ *   --mode=thread  one pthread per connection, blocking I/O
+ *
+ * This file holds everything the two modes have in common - argument parsing,
+ * signal handling, the listening socket and the counters - so that the only
+ * thing differing between them is the I/O strategy in server_epoll.c and
+ * server_thread.c.
  */
 
 #define _GNU_SOURCE
@@ -37,7 +42,7 @@ void bump_active(long delta) {
     }
 }
 
-void report(void) {
+void report(const char *mode) {
     struct rusage ru;
     getrusage(RUSAGE_SELF, &ru);
     double wall = (double)(now_ns() - g_stats.t_start) / 1e9;
@@ -45,9 +50,9 @@ void report(void) {
     double sys = (double)ru.ru_stime.tv_sec + (double)ru.ru_stime.tv_usec / 1e6;
 
     fprintf(stderr,
-            "server accepted=%llu requests=%llu bytes_in=%llu bytes_out=%llu "
+            "server mode=%s accepted=%llu requests=%llu bytes_in=%llu bytes_out=%llu "
             "errors=%llu peak_conns=%ld user_cpu_s=%.3f sys_cpu_s=%.3f wall_s=%.3f\n",
-            (unsigned long long)atomic_load(&g_stats.accepted),
+            mode, (unsigned long long)atomic_load(&g_stats.accepted),
             (unsigned long long)atomic_load(&g_stats.requests),
             (unsigned long long)atomic_load(&g_stats.bytes_in),
             (unsigned long long)atomic_load(&g_stats.bytes_out),
@@ -70,19 +75,28 @@ static int listen_socket(int port, int backlog) {
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) die("bind port %d", port);
     if (listen(fd, backlog) < 0) die("listen");
+    /* Non-blocking: the epoll loop drains the accept queue until EAGAIN.
+     * (The thread mode re-blocks it.) */
+    if (set_nonblocking(fd) < 0) die("set_nonblocking listen");
     return fd;
 }
 
 int main(int argc, char **argv) {
     long port = 9000, backlog = 4096, stack_kb = 512;
+    const char *mode = "epoll";
 
     for (int i = 1; i < argc; i++) {
         if (arg_long(argv[i], "port", &port)) continue;
         if (arg_long(argv[i], "backlog", &backlog)) continue;
         if (arg_long(argv[i], "stack-kb", &stack_kb)) continue;
-        fprintf(stderr, "usage: %s [--port=9000] [--backlog=4096] [--stack-kb=512]\n", argv[0]);
+        if (arg_str(argv[i], "mode", &mode)) continue;
+        fprintf(stderr,
+                "usage: %s [--port=9000] [--mode=epoll|thread] [--backlog=4096] [--stack-kb=512]\n",
+                argv[0]);
         return 2;
     }
+    if (strcmp(mode, "epoll") != 0 && strcmp(mode, "thread") != 0)
+        die("unknown mode '%s' (expected epoll or thread)", mode);
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -92,10 +106,16 @@ int main(int argc, char **argv) {
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
+    g_stats.t_start = now_ns();
+
     int lfd = listen_socket((int)port, (int)backlog);
     g_listen_fd = lfd;
-    fprintf(stderr, "listening port=%ld backlog=%ld\n", port, backlog);
+    fprintf(stderr, "listening mode=%s port=%ld backlog=%ld\n", mode, port, backlog);
 
-    run_thread_per_conn(lfd, stack_kb);
+    if (strcmp(mode, "epoll") == 0)
+        run_epoll(lfd, mode);
+    else
+        run_thread_per_conn(lfd, mode, stack_kb);
+
     return 0;
 }

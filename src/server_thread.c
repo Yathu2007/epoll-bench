@@ -1,12 +1,17 @@
 /*
- * Thread-per-connection mode: one detached pthread per connection, blocking I/O,
- * --stack-kb (default 512) per thread. SIGINT or SIGTERM breaks the accept loop.
+ * Thread-per-connection mode: one detached pthread per connection, blocking
+ * I/O, --stack-kb (default 512) per thread, same protocol handling as the
+ * epoll mode.
+ *
+ * This is the comparison baseline. It shares the accept path and the counters
+ * with the epoll mode so the I/O strategy is the only variable between them.
  */
 #define _GNU_SOURCE
 #include "server.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -33,9 +38,11 @@ static void *conn_thread(void *arg) {
         if (r < 0 && errno == EINTR) continue;
         if (r <= 0) break;
         len += (size_t)r;
+        atomic_fetch_add(&g_stats.bytes_in, (size_t)r);
 
         /* Echo every complete frame in one blocking write. */
         size_t off = 0;
+        unsigned long frames = 0;
         int bad = 0;
         for (;;) {
             if (len - off < PROTO_HDR_LEN) break;
@@ -60,6 +67,7 @@ static void *conn_thread(void *arg) {
                 break;
             }
             off += need;
+            frames++;
         }
         if (bad) break;
 
@@ -72,9 +80,11 @@ static void *conn_thread(void *arg) {
                 break;
             }
             sent += (size_t)w;
+            atomic_fetch_add(&g_stats.bytes_out, (size_t)w);
         }
         if (bad) break;
 
+        atomic_fetch_add(&g_stats.requests, frames);
         len -= off;
         if (len) memmove(buf, buf + off, len);
     }
@@ -82,10 +92,14 @@ static void *conn_thread(void *arg) {
     free(buf);
 out:
     close(fd);
+    bump_active(-1);
     return NULL;
 }
 
-void run_thread_per_conn(int lfd, long stack_kb) {
+void run_thread_per_conn(int lfd, const char *mode, long stack_kb) {
+    int flags = fcntl(lfd, F_GETFL, 0);
+    fcntl(lfd, F_SETFL, flags & ~O_NONBLOCK); /* blocking accept, one thread */
+
     int reported_limit = 0;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
@@ -97,6 +111,7 @@ void run_thread_per_conn(int lfd, long stack_kb) {
         if (cfd < 0) {
             if (errno == EINTR) continue;
             if (errno == EMFILE || errno == ENFILE) {
+                atomic_fetch_add(&g_stats.errors, 1);
                 sleep_ms(1);
                 continue;
             }
@@ -117,8 +132,11 @@ void run_thread_per_conn(int lfd, long stack_kb) {
             close(cfd);
             continue;
         }
+        atomic_fetch_add(&g_stats.accepted, 1);
+        bump_active(1);
     }
 
     pthread_attr_destroy(&attr);
     close(lfd);
+    report(mode);
 }
