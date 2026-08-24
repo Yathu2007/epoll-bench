@@ -1,9 +1,14 @@
 /*
  * Load generator for the framed-echo protocol.
  *
- * Closed loop: every connection keeps --depth requests in flight at all times
- * and sends a new one the moment a response lands. This measures saturation
- * throughput, not service latency.
+ * Open loop (default): every connection has a fixed request schedule derived
+ * from --rate, and latency is measured from the *intended* send time, so a
+ * server that falls behind shows up as queueing delay instead of silently
+ * lowering the offered load (coordinated omission).
+ *
+ * Closed loop (--closed): every connection keeps --depth requests in flight at
+ * all times and never waits on a schedule. Use it to find saturation
+ * throughput, not to characterise latency.
  */
 #define _GNU_SOURCE
 #include "common.h"
@@ -32,7 +37,9 @@ typedef struct {
 
 typedef struct conn {
     int fd;
+    long idx; /* global connection index; fixes its schedule slot */
     int dead;
+    uint64_t next_k; /* how many requests this connection has scheduled */
     uint64_t seq;
 
     unsigned char *rbuf;
@@ -64,14 +71,18 @@ typedef struct worker {
 static const char *g_host = "127.0.0.1";
 static long g_port = 9000;
 static long g_conns = 100;
+static long g_rate = 10000;
 static long g_duration = 10;
 static long g_payload = 128;
 static long g_threads = 4;
 static long g_depth = 1;
 static long g_budget = 8u << 20; /* total latency samples kept */
+static int g_closed = 0;
 
-static uint64_t g_t0;  /* start of the measured run */
-static uint64_t g_t_end; /* end of the run */
+static uint64_t g_t0;      /* start of the measured run */
+static uint64_t g_t_end;   /* end of the run */
+static uint64_t g_period;  /* ns between requests on one connection */
+static uint64_t g_stagger; /* ns between adjacent connections' slots */
 static pthread_barrier_t g_bar;
 
 static size_t g_frame_len;             /* PROTO_HDR_LEN + payload */
@@ -225,7 +236,7 @@ static int conn_read(worker *w, conn *c) {
             off += PROTO_HDR_LEN + len;
 
             /* Closed loop: one response out, one request in. */
-            if (now < g_t_end && send_request(w, c, now) < 0) return -1;
+            if (g_closed && now < g_t_end && send_request(w, c, now) < 0) return -1;
         }
         if (off) {
             c->rlen -= off;
@@ -301,6 +312,10 @@ static int connect_all(worker *w) {
 
 /* --------------------------------------------------------------- run phase */
 
+static uint64_t deadline_of(const conn *c) {
+    return g_t0 + (uint64_t)c->idx * g_stagger + c->next_k * g_period;
+}
+
 static void *worker_main(void *arg) {
     worker *w = arg;
     connect_all(w);
@@ -309,23 +324,36 @@ static void *worker_main(void *arg) {
     pthread_barrier_wait(&g_bar); /* g_t0 published */
 
     struct epoll_event ev[MAX_EVENTS];
+    long rr = 0;
 
-    uint64_t now = now_ns();
-    for (long i = 0; i < w->nconns; i++) {
-        conn *c = &w->conns[i];
-        if (c->dead) continue;
-        for (long d = 0; d < g_depth; d++)
-            if (send_request(w, c, now) < 0) {
-                conn_kill(w, c);
-                w->errors++;
-                break;
-            }
+    if (g_closed) {
+        uint64_t now = now_ns();
+        for (long i = 0; i < w->nconns; i++) {
+            conn *c = &w->conns[i];
+            if (c->dead) continue;
+            for (long d = 0; d < g_depth; d++)
+                if (send_request(w, c, now) < 0) {
+                    conn_kill(w, c);
+                    w->errors++;
+                    break;
+                }
+        }
     }
 
     for (;;) {
-        if (now_ns() >= g_t_end) break;
+        uint64_t now = now_ns();
+        if (now >= g_t_end) break;
 
-        int n = epoll_wait(w->epfd, ev, MAX_EVENTS, 10);
+        int64_t timeout_ns = 10 * 1000000;
+        if (!g_closed && w->nconns > 0) {
+            /* Connections share one period, so the round-robin head is always
+             * the next one due; no priority queue needed. */
+            uint64_t d = deadline_of(&w->conns[rr]);
+            timeout_ns = d > now ? (int64_t)(d - now) : 0;
+            if (timeout_ns > 10 * 1000000) timeout_ns = 10 * 1000000;
+        }
+
+        int n = epoll_wait(w->epfd, ev, MAX_EVENTS, (int)(timeout_ns / 1000000));
         if (n < 0 && errno != EINTR) break;
         for (int i = 0; i < n; i++) {
             conn *c = ev[i].data.ptr;
@@ -341,6 +369,29 @@ static void *worker_main(void *arg) {
                 conn_kill(w, c);
                 w->errors++;
             }
+        }
+
+        if (g_closed) continue;
+
+        now = now_ns();
+        while (w->nconns > 0) {
+            conn *c = &w->conns[rr];
+            uint64_t d = deadline_of(c);
+            if (d > now || d >= g_t_end) break;
+            c->next_k++;
+            rr = (rr + 1) % w->nconns;
+            if (c->dead) continue;
+            if (send_request(w, c, d) < 0) { /* stamp = intended time */
+                conn_kill(w, c);
+                w->errors++;
+                continue;
+            }
+            if (conn_flush(c) < 0) {
+                conn_kill(w, c);
+                w->errors++;
+                continue;
+            }
+            if (wbuf_pending(c)) mod_events(w, c, EPOLLIN | EPOLLOUT | EPOLLET);
         }
     }
 
@@ -381,14 +432,20 @@ int main(int argc, char **argv) {
         if (arg_str(argv[i], "host", &g_host)) continue;
         if (arg_long(argv[i], "port", &g_port)) continue;
         if (arg_long(argv[i], "conns", &g_conns)) continue;
+        if (arg_long(argv[i], "rate", &g_rate)) continue;
         if (arg_long(argv[i], "duration", &g_duration)) continue;
         if (arg_long(argv[i], "payload", &g_payload)) continue;
         if (arg_long(argv[i], "threads", &g_threads)) continue;
         if (arg_long(argv[i], "depth", &g_depth)) continue;
         if (arg_long(argv[i], "samples", &g_budget)) continue;
+        if (arg_flag(argv[i], "closed")) {
+            g_closed = 1;
+            continue;
+        }
         fprintf(stderr,
-                "usage: %s [--host=127.0.0.1] [--port=9000] [--conns=100] [--duration=10]\n"
-                "          [--payload=128] [--threads=4] [--depth=1] [--samples=8388608]\n",
+                "usage: %s [--host=127.0.0.1] [--port=9000] [--conns=100] [--rate=10000]\n"
+                "          [--duration=10] [--payload=128] [--threads=4]\n"
+                "          [--closed [--depth=1]] [--samples=8388608]\n",
                 argv[0]);
         return 2;
     }
@@ -396,6 +453,7 @@ int main(int argc, char **argv) {
         die("--payload must be between 8 and %u", PROTO_MAX_PAYLOAD);
     if (g_conns < 1) die("--conns must be >= 1");
     if (g_threads > g_conns) g_threads = g_conns;
+    if (!g_closed && g_rate < 1) die("--rate must be >= 1");
 
     signal(SIGPIPE, SIG_IGN);
 
@@ -405,6 +463,10 @@ int main(int argc, char **argv) {
     uint32_t nlen = htonl((uint32_t)g_payload);
     memcpy(g_frame_template, &nlen, PROTO_HDR_LEN);
     for (size_t i = PROTO_HDR_LEN; i < g_frame_len; i++) g_frame_template[i] = (unsigned char)i;
+
+    g_period = (uint64_t)(1e9 * (double)g_conns / (double)g_rate);
+    g_stagger = (uint64_t)(1e9 / (double)g_rate);
+    if (g_period == 0) g_period = 1;
 
     worker *ws = calloc((size_t)g_threads, sizeof(*ws));
     if (!ws) die("calloc workers");
@@ -423,6 +485,7 @@ int main(int argc, char **argv) {
         if (!w->lat) die("malloc latency buffer");
         for (long i = 0; i < w->nconns; i++) {
             conn *c = &w->conns[i];
+            c->idx = i * g_threads + t; /* keeps each worker's list index-sorted */
             c->rcap = 4096;
             c->rbuf = malloc(c->rcap);
             if (!c->rbuf) die("malloc read buffer");
@@ -476,13 +539,14 @@ int main(int argc, char **argv) {
 
 #define US(p) ((double)percentile(lat, total, (p)) / 1000.0)
     fprintf(stderr,
-            "loadgen closed-loop conns=%ld/%ld established in %.2fs payload=%ldB threads=%ld\n"
-            "  achieved=%.0f req/s over %.0fs\n"
+            "loadgen %s conns=%ld/%ld established in %.2fs payload=%ldB threads=%ld\n"
+            "  offered=%.0f req/s  achieved=%.0f req/s over %.0fs\n"
             "  latency us: p50=%.1f p90=%.1f p99=%.1f p99.9=%.1f max=%.1f (n=%zu)\n"
             "  sent=%llu recvd=%llu errors=%llu drops=%llu timeouts=%llu mismatch=%llu\n"
             "  loadgen cpu: user=%.2fs sys=%.2fs\n",
-            established, g_conns, connect_s, g_payload, g_threads, achieved, measured_s, US(0.50),
-            US(0.90), US(0.99), US(0.999), total ? (double)lat[total - 1] / 1000.0 : 0.0, total,
+            g_closed ? "closed-loop" : "open-loop", established, g_conns, connect_s, g_payload,
+            g_threads, g_closed ? 0.0 : (double)g_rate, achieved, measured_s, US(0.50), US(0.90),
+            US(0.99), US(0.999), total ? (double)lat[total - 1] / 1000.0 : 0.0, total,
             (unsigned long long)sent, (unsigned long long)recvd, (unsigned long long)errors,
             (unsigned long long)drops, (unsigned long long)timeouts,
             (unsigned long long)mismatch, user, sys);

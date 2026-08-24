@@ -25,6 +25,7 @@ void die(const char *fmt, ...);
  * and exits on a malformed value. */
 int arg_long(const char *arg, const char *name, long *out);
 int arg_str(const char *arg, const char *name, const char **out);
+int arg_flag(const char *arg, const char *name);
 
 /* In-place ascending sort of latency samples. */
 void sort_u64(uint64_t *a, size_t n);

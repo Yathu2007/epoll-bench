@@ -86,6 +86,10 @@ int arg_str(const char *arg, const char *name, const char **out) {
     return 1;
 }
 
+int arg_flag(const char *arg, const char *name) {
+    return strncmp(arg, "--", 2) == 0 && strcmp(arg + 2, name) == 0;
+}
+
 static int cmp_u64(const void *a, const void *b) {
     uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
     return (x > y) - (x < y);
