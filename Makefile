@@ -21,7 +21,10 @@ $(BIN)/loadgen: $(LOADGEN_SRC) $(SRC)/common.h | $(BIN)
 $(BIN):
 	mkdir -p $(BIN)
 
+check: all
+	./tests/smoke.sh
+
 clean:
 	rm -rf $(BIN)
 
-.PHONY: all clean
+.PHONY: all check clean
