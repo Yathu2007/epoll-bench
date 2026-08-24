@@ -61,8 +61,9 @@ typedef struct worker {
     long nconns;
     long established;
 
-    uint64_t *lat; /* latency samples, in ns */
-    size_t lat_cap, lat_n;
+    uint64_t *lat; /* reservoir of latency samples, in ns */
+    size_t lat_cap, lat_n, lat_seen;
+    unsigned rng;
 
     uint64_t sent, recvd, drops, errors, mismatch, timeouts;
 } worker;
@@ -112,7 +113,14 @@ static int wait_events(int epfd, struct epoll_event *ev, int max, int64_t timeou
 /* ---------------------------------------------------------------- sampling */
 
 static void record(worker *w, uint64_t lat_ns) {
-    if (w->lat_n < w->lat_cap) w->lat[w->lat_n++] = lat_ns;
+    w->lat_seen++;
+    if (w->lat_n < w->lat_cap) {
+        w->lat[w->lat_n++] = lat_ns;
+        return;
+    }
+    /* Reservoir sampling: keeps the sample uniform over the whole run. */
+    size_t j = (size_t)((double)rand_r(&w->rng) / ((double)RAND_MAX + 1.0) * (double)w->lat_seen);
+    if (j < w->lat_cap) w->lat[j] = lat_ns;
 }
 
 /* ---------------------------------------------------------------- plumbing */
@@ -502,6 +510,7 @@ int main(int argc, char **argv) {
     for (long t = 0; t < g_threads; t++) {
         worker *w = &ws[t];
         w->id = (int)t;
+        w->rng = (unsigned)(t * 7919 + 13);
         w->epfd = epoll_create1(0);
         if (w->epfd < 0) die("epoll_create1");
         w->nconns = g_conns / g_threads + (t < g_conns % g_threads ? 1 : 0);
@@ -535,7 +544,7 @@ int main(int argc, char **argv) {
     for (long t = 0; t < g_threads; t++) pthread_join(ws[t].th, NULL);
 
     /* -------------------------------------------------------- aggregate */
-    uint64_t sent = 0, recvd = 0, drops = 0, errors = 0, mismatch = 0, timeouts = 0;
+    uint64_t sent = 0, recvd = 0, drops = 0, errors = 0, mismatch = 0, timeouts = 0, seen = 0;
     long established = 0;
     size_t total = 0;
     for (long t = 0; t < g_threads; t++) total += ws[t].lat_n;
@@ -553,12 +562,13 @@ int main(int argc, char **argv) {
         errors += w->errors;
         mismatch += w->mismatch;
         timeouts += w->timeouts;
+        seen += w->lat_seen;
         established += w->established;
     }
     sort_u64(lat, total);
 
     double measured_s = (double)(g_t_end - g_t_meas) / 1e9;
-    double achieved = measured_s > 0 ? (double)total / measured_s : 0.0;
+    double achieved = measured_s > 0 ? (double)seen / measured_s : 0.0;
 
     struct rusage ru;
     getrusage(RUSAGE_SELF, &ru);
@@ -569,13 +579,13 @@ int main(int argc, char **argv) {
     fprintf(stderr,
             "loadgen %s conns=%ld/%ld established in %.2fs payload=%ldB threads=%ld\n"
             "  offered=%.0f req/s  achieved=%.0f req/s over %.0fs\n"
-            "  latency us: p50=%.1f p90=%.1f p99=%.1f p99.9=%.1f max=%.1f (n=%zu)\n"
+            "  latency us: p50=%.1f p90=%.1f p99=%.1f p99.9=%.1f max=%.1f (n=%zu of %llu)\n"
             "  sent=%llu recvd=%llu errors=%llu drops=%llu timeouts=%llu mismatch=%llu\n"
             "  loadgen cpu: user=%.2fs sys=%.2fs\n",
             g_closed ? "closed-loop" : "open-loop", established, g_conns, connect_s, g_payload,
             g_threads, g_closed ? 0.0 : (double)g_rate, achieved, measured_s, US(0.50), US(0.90),
             US(0.99), US(0.999), total ? (double)lat[total - 1] / 1000.0 : 0.0, total,
-            (unsigned long long)sent, (unsigned long long)recvd, (unsigned long long)errors,
+            (unsigned long long)seen, (unsigned long long)sent, (unsigned long long)recvd, (unsigned long long)errors,
             (unsigned long long)drops, (unsigned long long)timeouts,
             (unsigned long long)mismatch, user, sys);
 #undef US
