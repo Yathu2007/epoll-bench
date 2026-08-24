@@ -283,58 +283,77 @@ static int connect_all(worker *w) {
     addr.sin_port = htons((uint16_t)g_port);
     if (inet_pton(AF_INET, g_host, &addr.sin_addr) != 1) die("bad host %s", g_host);
 
-    long inflight = 0;
-    for (long i = 0; i < w->nconns; i++) {
-        conn *c = &w->conns[i];
-        c->fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (c->fd < 0) {
-            c->dead = 1;
-            w->errors++;
-            continue;
-        }
-        set_nonblocking(c->fd);
-        set_nodelay(c->fd);
-        int r = connect(c->fd, (struct sockaddr *)&addr, sizeof(addr));
-        if (r < 0 && errno != EINPROGRESS) {
-            close(c->fd);
-            c->dead = 1;
-            w->errors++;
-            continue;
-        }
-        c->events = EPOLLOUT;
-        struct epoll_event ev = {.events = EPOLLOUT, .data.ptr = c};
-        if (epoll_ctl(w->epfd, EPOLL_CTL_ADD, c->fd, &ev) < 0) {
-            close(c->fd);
-            c->dead = 1;
-            w->errors++;
-            continue;
-        }
-        inflight++;
-    }
+    const long batch = 256; /* keeps the server's accept queue from overflowing */
+    long done = 0;
 
-    struct epoll_event ev[MAX_EVENTS];
-    while (inflight > 0) {
-        int k = epoll_wait(w->epfd, ev, MAX_EVENTS, 200);
-        if (k < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-        for (int i = 0; i < k; i++) {
-            conn *c = ev[i].data.ptr;
-            int err = 0;
-            socklen_t elen = sizeof(err);
-            getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &err, &elen);
-            inflight--;
-            if (err != 0 || (ev[i].events & (EPOLLERR | EPOLLHUP))) {
-                epoll_ctl(w->epfd, EPOLL_CTL_DEL, c->fd, NULL);
+    while (done < w->nconns) {
+        long n = w->nconns - done < batch ? w->nconns - done : batch;
+        long inflight = 0;
+
+        for (long i = 0; i < n; i++) {
+            conn *c = &w->conns[done + i];
+            c->fd = socket(AF_INET, SOCK_STREAM, 0);
+            if (c->fd < 0) {
+                c->dead = 1;
+                w->errors++;
+                continue;
+            }
+            set_nonblocking(c->fd);
+            set_nodelay(c->fd);
+            int r = connect(c->fd, (struct sockaddr *)&addr, sizeof(addr));
+            if (r < 0 && errno != EINPROGRESS) {
                 close(c->fd);
                 c->dead = 1;
                 w->errors++;
                 continue;
             }
-            mod_events(w, c, EPOLLIN | EPOLLET);
-            w->established++;
+            c->events = EPOLLOUT;
+            struct epoll_event ev = {.events = EPOLLOUT, .data.ptr = c};
+            if (epoll_ctl(w->epfd, EPOLL_CTL_ADD, c->fd, &ev) < 0) {
+                close(c->fd);
+                c->dead = 1;
+                w->errors++;
+                continue;
+            }
+            inflight++;
         }
+
+        struct epoll_event ev[MAX_EVENTS];
+        uint64_t deadline = now_ns() + 10ull * 1000000000ull;
+        while (inflight > 0 && now_ns() < deadline) {
+            int k = epoll_wait(w->epfd, ev, MAX_EVENTS, 200);
+            if (k < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            for (int i = 0; i < k; i++) {
+                conn *c = ev[i].data.ptr;
+                int err = 0;
+                socklen_t elen = sizeof(err);
+                getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &err, &elen);
+                inflight--;
+                if (err != 0 || (ev[i].events & (EPOLLERR | EPOLLHUP))) {
+                    epoll_ctl(w->epfd, EPOLL_CTL_DEL, c->fd, NULL);
+                    close(c->fd);
+                    c->dead = 1;
+                    w->errors++;
+                    continue;
+                }
+                mod_events(w, c, EPOLLIN | EPOLLET);
+                w->established++;
+            }
+        }
+        /* Anything still in flight after the deadline never came up. */
+        for (long i = 0; i < n; i++) {
+            conn *c = &w->conns[done + i];
+            if (!c->dead && c->events == EPOLLOUT) {
+                epoll_ctl(w->epfd, EPOLL_CTL_DEL, c->fd, NULL);
+                close(c->fd);
+                c->dead = 1;
+                w->errors++;
+            }
+        }
+        done += n;
     }
     return 0;
 }
