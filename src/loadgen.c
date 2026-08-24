@@ -40,6 +40,7 @@ typedef struct conn {
     int fd;
     long idx; /* global connection index; fixes its schedule slot */
     int dead;
+    int connecting; /* registered for EPOLLOUT, connect not yet resolved */
     uint64_t next_k; /* how many requests this connection has scheduled */
     uint64_t seq;
 
@@ -315,6 +316,7 @@ static int connect_all(worker *w) {
                 w->errors++;
                 continue;
             }
+            c->connecting = 1;
             inflight++;
         }
 
@@ -328,6 +330,8 @@ static int connect_all(worker *w) {
             }
             for (int i = 0; i < k; i++) {
                 conn *c = ev[i].data.ptr;
+                if (!c->connecting) continue; /* already up; the run loop owns it */
+                c->connecting = 0;
                 int err = 0;
                 socklen_t elen = sizeof(err);
                 getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &err, &elen);
@@ -346,7 +350,8 @@ static int connect_all(worker *w) {
         /* Anything still in flight after the deadline never came up. */
         for (long i = 0; i < n; i++) {
             conn *c = &w->conns[done + i];
-            if (!c->dead && c->events == EPOLLOUT) {
+            if (!c->dead && c->connecting) {
+                c->connecting = 0;
                 epoll_ctl(w->epfd, EPOLL_CTL_DEL, c->fd, NULL);
                 close(c->fd);
                 c->dead = 1;
