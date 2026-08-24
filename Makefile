@@ -24,7 +24,10 @@ $(BIN):
 check: all
 	./tests/smoke.sh
 
+bench: all
+	./bench.sh
+
 clean:
 	rm -rf $(BIN)
 
-.PHONY: all check clean
+.PHONY: all check bench clean
