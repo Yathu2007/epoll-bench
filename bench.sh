@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Sweeps (mode x conns x loop) and writes one CSV row per run.
+# Reproduces the results table in README.md.
 #
 #   ./bench.sh                       # full sweep
 #   CONNS="100 1000" REPS=1 ./bench.sh
 #
 # Each (mode, conns) pair is measured twice: an open-loop run at a fixed
 # offered rate for latency, and a closed-loop run for saturation throughput.
+# Every run is repeated REPS times and the per-metric median is reported.
 set -euo pipefail
 
 PORT=${PORT:-9000}
@@ -34,6 +35,27 @@ if command -v taskset >/dev/null 2>&1; then
     TASKSET_L=(taskset -c "$LOADGEN_CPUS")
 else
     echo "warning: taskset not found; server and load generator share all cores" >&2
+fi
+
+# ------------------------------------------------------------------- env
+{
+    echo "date: $(date -Is)"
+    echo "kernel: $(uname -sr)"
+    echo "distro: $(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
+    echo "cpu: $(awk -F': ' '/model name/{print $2; exit}' /proc/cpuinfo)"
+    echo "cores: $(nproc) logical"
+    echo "memory: $(awk '/MemTotal/{printf "%.1f GiB", $2/1048576}' /proc/meminfo)"
+    echo "ulimit -n: $(ulimit -n)"
+    echo "ulimit -u: $(ulimit -u)"
+    echo "somaxconn: $(cat /proc/sys/net/core/somaxconn)"
+    echo "cgroup pids.max: $(cat /sys/fs/cgroup"$(awk -F: '{print $3}' /proc/self/cgroup)"/pids.max 2>/dev/null || echo n/a)"
+    echo "server cpus: $SERVER_CPUS   loadgen cpus: $LOADGEN_CPUS"
+    echo "cc: $(${CC:-cc} --version | head -1)"
+} | tee "$OUTDIR/env.txt"
+echo
+
+if [ "$(ulimit -n)" -lt 20000 ]; then
+    echo "warning: ulimit -n is $(ulimit -n); run 'ulimit -n 100000' before large sweeps" >&2
 fi
 
 echo "mode,loop,conns,rep,$(echo '')" >/dev/null
@@ -103,5 +125,49 @@ for mode in $MODES; do
     done
 done
 
+# ------------------------------------------------------- median summary
+awk -F, -v rate="$RATE" -v payload="$PAYLOAD" -v depth="$DEPTH" '
+function median(arr, n,   i, tmp, j, k, t) {
+    for (i = 1; i <= n; i++) tmp[i] = arr[i]
+    for (i = 2; i <= n; i++) { t = tmp[i]; for (j = i-1; j >= 1 && tmp[j] > t; j--) tmp[j+1] = tmp[j]; tmp[j+1] = t }
+    k = int((n+1)/2)
+    return (n % 2) ? tmp[k] : (tmp[k] + tmp[k+1]) / 2
+}
+NR == 1 { next }
+{
+    key = $1 "," $2 "," $3
+    if (!(key in seen)) { seen[key] = 1; order[++nkeys] = key }
+    n[key]++
+    est[key,n[key]] = $5; rate_a[key,n[key]] = $6; p50[key,n[key]] = $7; p99[key,n[key]] = $9
+    p999[key,n[key]] = $10; err[key,n[key]] = $12 + $14; rss[key,n[key]] = $18
+    perconn[key,n[key]] = $19; ucpu[key,n[key]] = $20; scpu[key,n[key]] = $21
+}
+END {
+    printf "\n### Latency under fixed offered load (open loop, %d req/s, %d B payload)\n\n", rate, payload
+    printf "| mode | conns | established | achieved req/s | p50 (us) | p99 (us) | p99.9 (us) | peak RSS (MB) | mem/conn (KB) | user CPU (s) | sys CPU (s) | errors |\n"
+    printf "|---|---|---|---|---|---|---|---|---|---|---|---|\n"
+    for (i = 1; i <= nkeys; i++) {
+        split(order[i], f, ",")
+        if (f[2] != "open") continue
+        k = order[i]; m = n[k]
+        for (j = 1; j <= m; j++) { a[j]=est[k,j]; b[j]=rate_a[k,j]; c[j]=p50[k,j]; d[j]=p99[k,j]; e[j]=p999[k,j]; g[j]=rss[k,j]; h[j]=perconn[k,j]; u[j]=ucpu[k,j]; s[j]=scpu[k,j]; x[j]=err[k,j] }
+        printf "| %s | %s | %d | %.0f | %.1f | %.1f | %.1f | %.1f | %.2f | %.2f | %.2f | %d |\n",
+            f[1], f[3], median(a,m), median(b,m), median(c,m), median(d,m), median(e,m),
+            median(g,m)/1024, median(h,m)/1024, median(u,m), median(s,m), median(x,m)
+    }
+    printf "\n### Saturation throughput (closed loop, %d request(s) in flight per connection)\n\n", depth
+    printf "| mode | conns | established | req/s | p50 (us) | p99 (us) | peak RSS (MB) | mem/conn (KB) | user CPU (s) | sys CPU (s) |\n"
+    printf "|---|---|---|---|---|---|---|---|---|---|\n"
+    for (i = 1; i <= nkeys; i++) {
+        split(order[i], f, ",")
+        if (f[2] != "closed") continue
+        k = order[i]; m = n[k]
+        for (j = 1; j <= m; j++) { a[j]=est[k,j]; b[j]=rate_a[k,j]; c[j]=p50[k,j]; d[j]=p99[k,j]; g[j]=rss[k,j]; h[j]=perconn[k,j]; u[j]=ucpu[k,j]; s[j]=scpu[k,j] }
+        printf "| %s | %s | %d | %.0f | %.1f | %.1f | %.1f | %.2f | %.2f | %.2f |\n",
+            f[1], f[3], median(a,m), median(b,m), median(c,m), median(d,m),
+            median(g,m)/1024, median(h,m)/1024, median(u,m), median(s,m)
+    }
+}' "$RAW" | tee "$OUTDIR/summary.md"
+
 echo
-echo "raw runs: $RAW"
+echo "raw runs: $RAW    summary: $OUTDIR/summary.md    env: $OUTDIR/env.txt"
