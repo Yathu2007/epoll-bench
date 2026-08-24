@@ -73,6 +73,7 @@ static long g_port = 9000;
 static long g_conns = 100;
 static long g_rate = 10000;
 static long g_duration = 10;
+static long g_warmup = 2;
 static long g_payload = 128;
 static long g_threads = 4;
 static long g_depth = 1;
@@ -80,6 +81,7 @@ static long g_budget = 8u << 20; /* total latency samples kept */
 static int g_closed = 0;
 
 static uint64_t g_t0;      /* start of the measured run */
+static uint64_t g_t_meas;  /* end of warm-up */
 static uint64_t g_t_end;   /* end of the run */
 static uint64_t g_period;  /* ns between requests on one connection */
 static uint64_t g_stagger; /* ns between adjacent connections' slots */
@@ -232,7 +234,7 @@ static int conn_read(worker *w, conn *c) {
             if (seq != p.seq) w->mismatch++;
 
             w->recvd++;
-            record(w, now - p.t);
+            if (p.t >= g_t_meas) record(w, now - p.t);
             off += PROTO_HDR_LEN + len;
 
             /* Closed loop: one response out, one request in. */
@@ -434,6 +436,7 @@ int main(int argc, char **argv) {
         if (arg_long(argv[i], "conns", &g_conns)) continue;
         if (arg_long(argv[i], "rate", &g_rate)) continue;
         if (arg_long(argv[i], "duration", &g_duration)) continue;
+        if (arg_long(argv[i], "warmup", &g_warmup)) continue;
         if (arg_long(argv[i], "payload", &g_payload)) continue;
         if (arg_long(argv[i], "threads", &g_threads)) continue;
         if (arg_long(argv[i], "depth", &g_depth)) continue;
@@ -444,7 +447,7 @@ int main(int argc, char **argv) {
         }
         fprintf(stderr,
                 "usage: %s [--host=127.0.0.1] [--port=9000] [--conns=100] [--rate=10000]\n"
-                "          [--duration=10] [--payload=128] [--threads=4]\n"
+                "          [--duration=10] [--warmup=2] [--payload=128] [--threads=4]\n"
                 "          [--closed [--depth=1]] [--samples=8388608]\n",
                 argv[0]);
         return 2;
@@ -501,7 +504,8 @@ int main(int argc, char **argv) {
     double connect_s = (double)(now_ns() - t_connect) / 1e9;
 
     g_t0 = now_ns() + 50000000ull;
-    g_t_end = g_t0 + (uint64_t)g_duration * 1000000000ull;
+    g_t_meas = g_t0 + (uint64_t)g_warmup * 1000000000ull;
+    g_t_end = g_t0 + (uint64_t)(g_warmup + g_duration) * 1000000000ull;
     pthread_barrier_wait(&g_bar);
 
     for (long t = 0; t < g_threads; t++) pthread_join(ws[t].th, NULL);
@@ -529,8 +533,8 @@ int main(int argc, char **argv) {
     }
     sort_u64(lat, total);
 
-    double measured_s = (double)(g_t_end - g_t0) / 1e9;
-    double achieved = measured_s > 0 ? (double)recvd / measured_s : 0.0;
+    double measured_s = (double)(g_t_end - g_t_meas) / 1e9;
+    double achieved = measured_s > 0 ? (double)total / measured_s : 0.0;
 
     struct rusage ru;
     getrusage(RUSAGE_SELF, &ru);
