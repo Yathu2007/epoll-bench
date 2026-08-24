@@ -26,12 +26,14 @@
 #define MAX_EVENTS 512
 
 typedef struct {
-    uint64_t t; /* timestamp latency is measured from */
+    uint64_t t;   /* timestamp latency is measured from */
+    uint64_t seq; /* echoed back inside the payload, checked on arrival */
 } pending;
 
 typedef struct conn {
     int fd;
     int dead;
+    uint64_t seq;
 
     unsigned char *rbuf;
     size_t rcap, rlen;
@@ -54,7 +56,7 @@ typedef struct worker {
     uint64_t *lat; /* latency samples, in ns */
     size_t lat_cap, lat_n;
 
-    uint64_t sent, recvd, drops, errors, timeouts;
+    uint64_t sent, recvd, drops, errors, mismatch, timeouts;
 } worker;
 
 /* -------------------------------------------------------------- run config */
@@ -73,7 +75,7 @@ static uint64_t g_t_end; /* end of the run */
 static pthread_barrier_t g_bar;
 
 static size_t g_frame_len;             /* PROTO_HDR_LEN + payload */
-static unsigned char *g_frame_template; /* header + filler */
+static unsigned char *g_frame_template; /* header + filler, seq patched per send */
 
 /* ---------------------------------------------------------------- sampling */
 
@@ -160,11 +162,22 @@ static int send_request(worker *w, conn *c, uint64_t stamp) {
         w->drops++;
         return 0; /* server is too far behind to track more in flight */
     }
+    unsigned char frame[PROTO_HDR_LEN + 8];
+    uint64_t seq = c->seq++;
+
+    /* Header + sequence number; the rest of the payload is the template. */
+    memcpy(frame, g_frame_template, PROTO_HDR_LEN);
+    memcpy(frame + PROTO_HDR_LEN, &seq, 8);
+
     size_t idx = (c->phead + c->pcount) % PENDING_CAP;
     c->pend[idx].t = stamp;
+    c->pend[idx].seq = seq;
     c->pcount++;
 
-    if (conn_write(c, g_frame_template, g_frame_len) < 0) return -1;
+    if (conn_write(c, frame, sizeof(frame)) < 0) return -1;
+    if (g_frame_len > sizeof(frame) &&
+        conn_write(c, g_frame_template + sizeof(frame), g_frame_len - sizeof(frame)) < 0)
+        return -1;
 
     w->sent++;
     return 0;
@@ -202,6 +215,10 @@ static int conn_read(worker *w, conn *c) {
             pending p = c->pend[c->phead];
             c->phead = (c->phead + 1) % PENDING_CAP;
             c->pcount--;
+
+            uint64_t seq;
+            memcpy(&seq, c->rbuf + off + PROTO_HDR_LEN, 8);
+            if (seq != p.seq) w->mismatch++;
 
             w->recvd++;
             record(w, now - p.t);
@@ -427,7 +444,7 @@ int main(int argc, char **argv) {
     for (long t = 0; t < g_threads; t++) pthread_join(ws[t].th, NULL);
 
     /* -------------------------------------------------------- aggregate */
-    uint64_t sent = 0, recvd = 0, drops = 0, errors = 0, timeouts = 0;
+    uint64_t sent = 0, recvd = 0, drops = 0, errors = 0, mismatch = 0, timeouts = 0;
     long established = 0;
     size_t total = 0;
     for (long t = 0; t < g_threads; t++) total += ws[t].lat_n;
@@ -443,6 +460,7 @@ int main(int argc, char **argv) {
         recvd += w->recvd;
         drops += w->drops;
         errors += w->errors;
+        mismatch += w->mismatch;
         timeouts += w->timeouts;
         established += w->established;
     }
@@ -461,12 +479,13 @@ int main(int argc, char **argv) {
             "loadgen closed-loop conns=%ld/%ld established in %.2fs payload=%ldB threads=%ld\n"
             "  achieved=%.0f req/s over %.0fs\n"
             "  latency us: p50=%.1f p90=%.1f p99=%.1f p99.9=%.1f max=%.1f (n=%zu)\n"
-            "  sent=%llu recvd=%llu errors=%llu drops=%llu timeouts=%llu\n"
+            "  sent=%llu recvd=%llu errors=%llu drops=%llu timeouts=%llu mismatch=%llu\n"
             "  loadgen cpu: user=%.2fs sys=%.2fs\n",
             established, g_conns, connect_s, g_payload, g_threads, achieved, measured_s, US(0.50),
             US(0.90), US(0.99), US(0.999), total ? (double)lat[total - 1] / 1000.0 : 0.0, total,
             (unsigned long long)sent, (unsigned long long)recvd, (unsigned long long)errors,
-            (unsigned long long)drops, (unsigned long long)timeouts, user, sys);
+            (unsigned long long)drops, (unsigned long long)timeouts,
+            (unsigned long long)mismatch, user, sys);
 #undef US
 
     return 0;
