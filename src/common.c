@@ -35,6 +35,21 @@ int set_nodelay(int fd) {
     return setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 }
 
+long read_vmrss_kb(void) {
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    char line[256];
+    long kb = -1;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "VmRSS:", 6) == 0) {
+            kb = strtol(line + 6, NULL, 10);
+            break;
+        }
+    }
+    fclose(f);
+    return kb;
+}
+
 void die(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);

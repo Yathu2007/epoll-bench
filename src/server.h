@@ -13,6 +13,8 @@
 struct server_stats {
     atomic_ullong accepted, requests, bytes_in, bytes_out, errors;
     atomic_long active, peak_active;
+    atomic_long peak_rss_kb;
+    long base_rss_kb;
     uint64_t t_start;
 };
 

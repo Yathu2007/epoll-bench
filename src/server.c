@@ -14,6 +14,7 @@
 #include "server.h"
 
 #include <netinet/in.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,22 +49,40 @@ void bump_active(long delta) {
     }
 }
 
+/* Samples VmRSS so the reported peak reflects load, not post-teardown state. */
+static void *rss_monitor(void *arg) {
+    (void)arg;
+    while (!g_stop) {
+        long kb = read_vmrss_kb();
+        long peak = atomic_load(&g_stats.peak_rss_kb);
+        while (kb > peak && !atomic_compare_exchange_weak(&g_stats.peak_rss_kb, &peak, kb)) {
+        }
+        sleep_ms(50);
+    }
+    return NULL;
+}
+
 void report(const char *mode) {
     struct rusage ru;
     getrusage(RUSAGE_SELF, &ru);
     double wall = (double)(now_ns() - g_stats.t_start) / 1e9;
     double user = (double)ru.ru_utime.tv_sec + (double)ru.ru_utime.tv_usec / 1e6;
     double sys = (double)ru.ru_stime.tv_sec + (double)ru.ru_stime.tv_usec / 1e6;
+    long peak_conns = atomic_load(&g_stats.peak_active);
+    long rss_peak = atomic_load(&g_stats.peak_rss_kb);
+    double per_conn =
+        peak_conns > 0 ? (double)(rss_peak - g_stats.base_rss_kb) * 1024.0 / (double)peak_conns : 0.0;
 
     fprintf(stderr,
             "server mode=%s accepted=%llu requests=%llu bytes_in=%llu bytes_out=%llu "
-            "errors=%llu peak_conns=%ld user_cpu_s=%.3f sys_cpu_s=%.3f wall_s=%.3f\n",
+            "errors=%llu peak_conns=%ld rss_base_kb=%ld rss_peak_kb=%ld bytes_per_conn=%.0f "
+            "user_cpu_s=%.3f sys_cpu_s=%.3f wall_s=%.3f\n",
             mode, (unsigned long long)atomic_load(&g_stats.accepted),
             (unsigned long long)atomic_load(&g_stats.requests),
             (unsigned long long)atomic_load(&g_stats.bytes_in),
             (unsigned long long)atomic_load(&g_stats.bytes_out),
-            (unsigned long long)atomic_load(&g_stats.errors),
-            atomic_load(&g_stats.peak_active), user, sys, wall);
+            (unsigned long long)atomic_load(&g_stats.errors), peak_conns, g_stats.base_rss_kb,
+            rss_peak, per_conn, user, sys, wall);
 }
 
 static int listen_socket(int port, int backlog) {
@@ -113,10 +132,19 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sa, NULL);
 
     g_stats.t_start = now_ns();
+    g_stats.base_rss_kb = read_vmrss_kb();
+    atomic_store(&g_stats.peak_rss_kb, g_stats.base_rss_kb);
 
     int lfd = listen_socket((int)port, (int)backlog);
     g_listen_fd = lfd;
-    fprintf(stderr, "listening mode=%s port=%ld backlog=%ld\n", mode, port, backlog);
+
+    pthread_t mon;
+    pthread_create(&mon, NULL, rss_monitor, NULL);
+
+    struct rlimit rl;
+    getrlimit(RLIMIT_NOFILE, &rl);
+    fprintf(stderr, "listening mode=%s port=%ld backlog=%ld nofile=%ld base_rss_kb=%ld\n", mode, port,
+            backlog, (long)rl.rlim_cur, g_stats.base_rss_kb);
 
     if (strcmp(mode, "epoll") == 0)
         run_epoll(lfd, mode);

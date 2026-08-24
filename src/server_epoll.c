@@ -2,7 +2,8 @@
  * Single-threaded, edge-triggered epoll mode.
  *
  * One thread owns every connection, so nothing here needs locking; the shared
- * counters in g_stats are atomic only because the thread mode shares them.
+ * counters in g_stats are atomic only because the thread mode and the RSS
+ * monitor share them.
  */
 #define _GNU_SOURCE
 #include "server.h"

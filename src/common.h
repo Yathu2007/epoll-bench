@@ -16,6 +16,9 @@ void sleep_ms(unsigned ms);
 int set_nonblocking(int fd);
 int set_nodelay(int fd);
 
+/* VmRSS of this process in kB, or -1 if unavailable. */
+long read_vmrss_kb(void);
+
 void die(const char *fmt, ...);
 
 /* "--name=123" -> *out = 123. Returns 1 on match, 0 if the flag is not `name`,
