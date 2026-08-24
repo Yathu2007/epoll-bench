@@ -25,6 +25,7 @@
 #include <sys/epoll.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #define PENDING_CAP 512u /* max outstanding requests tracked per connection */
@@ -78,6 +79,7 @@ static long g_payload = 128;
 static long g_threads = 4;
 static long g_depth = 1;
 static long g_budget = 8u << 20; /* total latency samples kept */
+static long g_spin_us = 60;      /* busy-wait window before a send deadline */
 static int g_closed = 0;
 
 static uint64_t g_t0;      /* start of the measured run */
@@ -89,6 +91,23 @@ static pthread_barrier_t g_bar;
 
 static size_t g_frame_len;             /* PROTO_HDR_LEN + payload */
 static unsigned char *g_frame_template; /* header + filler, seq patched per send */
+
+/*
+ * epoll_wait's timeout is in whole milliseconds, but the open-loop schedule
+ * puts deadlines microseconds apart; rounding down to 0 turns the wait into a
+ * busy spin that steals CPU from the server under test. epoll_pwait2 takes a
+ * timespec, so the generator actually sleeps between sends.
+ */
+static int wait_events(int epfd, struct epoll_event *ev, int max, int64_t timeout_ns) {
+    static int have_pwait2 = 1;
+    if (have_pwait2 && timeout_ns >= 0) {
+        struct timespec ts = {.tv_sec = timeout_ns / 1000000000, .tv_nsec = timeout_ns % 1000000000};
+        int r = (int)syscall(SYS_epoll_pwait2, epfd, ev, max, &ts, NULL, (size_t)(64 / 8));
+        if (r >= 0 || errno != ENOSYS) return r;
+        have_pwait2 = 0;
+    }
+    return epoll_wait(epfd, ev, max, timeout_ns < 0 ? -1 : (int)(timeout_ns / 1000000));
+}
 
 /* ---------------------------------------------------------------- sampling */
 
@@ -351,11 +370,15 @@ static void *worker_main(void *arg) {
             /* Connections share one period, so the round-robin head is always
              * the next one due; no priority queue needed. */
             uint64_t d = deadline_of(&w->conns[rr]);
-            timeout_ns = d > now ? (int64_t)(d - now) : 0;
+            /* Sleep until shortly before the deadline, then busy-wait: a timed
+             * wakeup overshoots by tens of microseconds, which would be charged
+             * to the server as latency. */
+            timeout_ns = d > now ? (int64_t)(d - now) - g_spin_us * 1000 : 0;
+            if (timeout_ns < 0) timeout_ns = 0;
             if (timeout_ns > 10 * 1000000) timeout_ns = 10 * 1000000;
         }
 
-        int n = epoll_wait(w->epfd, ev, MAX_EVENTS, (int)(timeout_ns / 1000000));
+        int n = wait_events(w->epfd, ev, MAX_EVENTS, timeout_ns);
         if (n < 0 && errno != EINTR) break;
         for (int i = 0; i < n; i++) {
             conn *c = ev[i].data.ptr;
@@ -441,6 +464,7 @@ int main(int argc, char **argv) {
         if (arg_long(argv[i], "threads", &g_threads)) continue;
         if (arg_long(argv[i], "depth", &g_depth)) continue;
         if (arg_long(argv[i], "samples", &g_budget)) continue;
+        if (arg_long(argv[i], "spin-us", &g_spin_us)) continue;
         if (arg_flag(argv[i], "closed")) {
             g_closed = 1;
             continue;
@@ -448,7 +472,7 @@ int main(int argc, char **argv) {
         fprintf(stderr,
                 "usage: %s [--host=127.0.0.1] [--port=9000] [--conns=100] [--rate=10000]\n"
                 "          [--duration=10] [--warmup=2] [--payload=128] [--threads=4]\n"
-                "          [--closed [--depth=1]] [--samples=8388608]\n",
+                "          [--closed [--depth=1]] [--samples=8388608] [--spin-us=60]\n",
                 argv[0]);
         return 2;
     }
