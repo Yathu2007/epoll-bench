@@ -612,7 +612,16 @@ int main(int argc, char **argv) {
             (unsigned long long)seen, (unsigned long long)sent, (unsigned long long)recvd, (unsigned long long)errors,
             (unsigned long long)drops, (unsigned long long)timeouts,
             (unsigned long long)mismatch, user, sys);
+    printf("result loop=%s conns=%ld established=%ld payload=%ld rate_target=%ld "
+           "rate_achieved=%.0f p50_us=%.1f p90_us=%.1f p99_us=%.1f p999_us=%.1f max_us=%.1f "
+           "sent=%llu recvd=%llu errors=%llu drops=%llu timeouts=%llu mismatch=%llu samples=%zu "
+           "lg_user_cpu_s=%.3f lg_sys_cpu_s=%.3f\n",
+           g_closed ? "closed" : "open", g_conns, established, g_payload, g_closed ? 0 : g_rate,
+           achieved, US(0.50), US(0.90), US(0.99), US(0.999),
+           total ? (double)lat[total - 1] / 1000.0 : 0.0, (unsigned long long)sent,
+           (unsigned long long)recvd, (unsigned long long)errors, (unsigned long long)drops,
+           (unsigned long long)timeouts, (unsigned long long)mismatch, total, user, sys);
 #undef US
 
-    return 0;
+    return (errors || mismatch) ? 1 : 0;
 }
