@@ -26,4 +26,9 @@ void die(const char *fmt, ...);
 int arg_long(const char *arg, const char *name, long *out);
 int arg_str(const char *arg, const char *name, const char **out);
 
+/* In-place ascending sort of latency samples. */
+void sort_u64(uint64_t *a, size_t n);
+/* p in [0,1]; a must be sorted, n > 0. */
+uint64_t percentile(const uint64_t *a, size_t n, double p);
+
 #endif

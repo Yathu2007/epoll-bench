@@ -85,3 +85,19 @@ int arg_str(const char *arg, const char *name, const char **out) {
     *out = v;
     return 1;
 }
+
+static int cmp_u64(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return (x > y) - (x < y);
+}
+
+void sort_u64(uint64_t *a, size_t n) { qsort(a, n, sizeof(*a), cmp_u64); }
+
+uint64_t percentile(const uint64_t *a, size_t n, double p) {
+    if (n == 0) return 0;
+    double idx = p * (double)(n - 1);
+    size_t i = (size_t)idx;
+    if (i + 1 >= n) return a[n - 1];
+    double frac = idx - (double)i;
+    return a[i] + (uint64_t)(frac * (double)(a[i + 1] - a[i]));
+}
